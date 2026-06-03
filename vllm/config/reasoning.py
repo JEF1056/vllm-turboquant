@@ -26,6 +26,12 @@ class ReasoningConfig:
     reasoning_end_str: str = ""
     """String that indicates the end of reasoning content."""
 
+    default_thinking_token_budget: int | None = None
+    """Default thinking token budget applied to requests that do not specify
+    one explicitly.  Set via ``--reasoning-config`` JSON, e.g.
+    ``'{"default_thinking_token_budget": 4096}'``.  ``None`` means unlimited
+    (no budget enforced by default)."""
+
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
     )

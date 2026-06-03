@@ -52,6 +52,12 @@ class ThinkingBudgetStateHolder:
         # No separate enable flag: a non-``None`` ``reasoning_config`` is the switch.
         self.is_enabled = reasoning_config is not None
 
+        self._default_thinking_token_budget: int | None = (
+            reasoning_config.default_thinking_token_budget
+            if reasoning_config is not None
+            else None
+        )
+
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
@@ -88,6 +94,8 @@ class ThinkingBudgetStateHolder:
 
         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
             thinking_token_budget = params.thinking_token_budget
+            if thinking_token_budget is None:
+                thinking_token_budget = self._default_thinking_token_budget
             if thinking_token_budget is not None:
                 self._state[index] = self._init_state_entry(
                     prompt_tok_ids, thinking_token_budget
