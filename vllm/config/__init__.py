@@ -10,6 +10,7 @@ from vllm.config.compilation import (
     PassConfig,
 )
 from vllm.config.device import DeviceConfig
+from vllm.config.dry import DRYConfig
 from vllm.config.ec_transfer import ECTransferConfig
 from vllm.config.kernel import KernelConfig
 from vllm.config.kv_events import KVEventsConfig

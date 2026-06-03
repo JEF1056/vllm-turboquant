@@ -33,6 +33,7 @@ from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
+from .dry import DRYConfig
 from .ec_transfer import ECTransferConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
@@ -341,6 +342,8 @@ class VllmConfig:
     """The configurations for distributed EC cache transfer."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
+    dry_config: DRYConfig | None = None
+    """Server-wide DRY sampling configuration.  ``None`` = disabled."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
