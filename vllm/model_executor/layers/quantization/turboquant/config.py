@@ -15,8 +15,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Named TQ presets: each maps to frozen config parameters.
-# key_quant_bits: 8 = FP8 keys, 3-4 = MSE (Lloyd-Max) quantized keys.
-# value_quant_bits: 3-4 = uniform quantized values.
+# key_quant_bits: 8 = FP8 keys, 2-4 = MSE (Lloyd-Max) quantized keys.
+# value_quant_bits: 1-4 = uniform quantized values.
 TQ_PRESETS: dict[str, dict] = {
     "turboquant_k8v4": {
         "key_quant_bits": 8,
@@ -36,6 +36,36 @@ TQ_PRESETS: dict[str, dict] = {
     "turboquant_3bit_nc": {
         "key_quant_bits": 3,
         "value_quant_bits": 3,
+        "norm_correction": True,
+    },
+    "turboquant_k4v2_nc": {
+        "key_quant_bits": 4,
+        "value_quant_bits": 2,
+        "norm_correction": True,
+    },
+    "turboquant_k3v2_nc": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 2,
+        "norm_correction": True,
+    },
+    "turboquant_2bit_nc": {
+        "key_quant_bits": 2,
+        "value_quant_bits": 2,
+        "norm_correction": True,
+    },
+    "turboquant_k4v1_nc": {
+        "key_quant_bits": 4,
+        "value_quant_bits": 1,
+        "norm_correction": True,
+    },
+    "turboquant_k3v1_nc": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 1,
+        "norm_correction": True,
+    },
+    "turboquant_k2v1_nc": {
+        "key_quant_bits": 2,
+        "value_quant_bits": 1,
         "norm_correction": True,
     },
 }
@@ -73,13 +103,19 @@ class TurboQuantConfig:
         turboquant_4bit_nc: 4-bit MSE keys + 4-bit values + NC, 3.8x, +2.71%
         turboquant_k3v4_nc: 3-bit MSE keys + 4-bit values + NC, ~3.5x, +10.63%
         turboquant_3bit_nc: 3-bit MSE keys + 3-bit values + NC, 4.9x, +20.59%
+        turboquant_k4v2_nc: 4-bit MSE keys + 2-bit values + NC, ~5.0x
+        turboquant_k3v2_nc: 3-bit MSE keys + 2-bit values + NC, ~5.8x
+        turboquant_2bit_nc: 2-bit MSE keys + 2-bit values + NC, ~7.0x
+        turboquant_k4v1_nc: 4-bit MSE keys + 1-bit values + NC, ~6.0x
+        turboquant_k3v1_nc: 3-bit MSE keys + 1-bit values + NC, ~7.3x
+        turboquant_k2v1_nc: 2-bit MSE keys + 1-bit values + NC, ~9.5x
 
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
         key_quant_bits: Bits for key quantization. 8 = FP8 keys (no
-            rotation/MSE). 3-4 = Lloyd-Max MSE quantized keys.
+            rotation/MSE). 2-4 = Lloyd-Max MSE quantized keys.
         value_quant_bits: Bits per value dimension for uniform quantization.
-            3 = 8 levels, 4 = 16 levels (default).
+            1 = 2 levels, 2 = 4 levels, 3 = 8 levels, 4 = 16 levels (default).
         norm_correction: Re-normalize centroid vectors to unit norm before
             inverse rotation during dequant. Fixes quantization-induced norm
             distortion, improving PPL by ~0.8% at 4-bit.

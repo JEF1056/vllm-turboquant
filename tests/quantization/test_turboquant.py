@@ -72,6 +72,54 @@ PRESET_EXPECTED = {
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
+    "turboquant_k4v2_nc": dict(
+        key_fp8=False, key_quant_bits=4,
+        key_mse_bits=4, value_quant_bits=2,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=True,
+        key_packed_size=66, value_packed_size=36,
+        slot_size=102, slot_size_aligned=102,
+    ),
+    "turboquant_k3v2_nc": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=2,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=36,
+        slot_size=86, slot_size_aligned=86,
+    ),
+    "turboquant_2bit_nc": dict(
+        key_fp8=False, key_quant_bits=2,
+        key_mse_bits=2, value_quant_bits=2,
+        mse_bits=2, n_centroids=4, centroid_bits=2,
+        norm_correction=True,
+        key_packed_size=34, value_packed_size=36,
+        slot_size=70, slot_size_aligned=70,
+    ),
+    "turboquant_k4v1_nc": dict(
+        key_fp8=False, key_quant_bits=4,
+        key_mse_bits=4, value_quant_bits=1,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=True,
+        key_packed_size=66, value_packed_size=20,
+        slot_size=86, slot_size_aligned=86,
+    ),
+    "turboquant_k3v1_nc": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=1,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=20,
+        slot_size=70, slot_size_aligned=70,
+    ),
+    "turboquant_k2v1_nc": dict(
+        key_fp8=False, key_quant_bits=2,
+        key_mse_bits=2, value_quant_bits=1,
+        mse_bits=2, n_centroids=4, centroid_bits=2,
+        norm_correction=True,
+        key_packed_size=34, value_packed_size=20,
+        slot_size=54, slot_size_aligned=54,
+    ),
 }
 # fmt: on
 
@@ -169,7 +217,7 @@ class TestTurboQuantConfig:
             assert cfg.key_quant_bits == 8
         else:
             assert cfg.key_mse_bits > 0
-            assert cfg.key_quant_bits in (3, 4)
+            assert cfg.key_quant_bits in (2, 3, 4)
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
     @pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
@@ -282,12 +330,12 @@ class TestHybridAttentionIndices:
 
 
 class TestCentroids:
-    @pytest.mark.parametrize("bits,expected_n", [(2, 4), (3, 8), (4, 16)])
+    @pytest.mark.parametrize("bits,expected_n", [(1, 2), (2, 4), (3, 8), (4, 16)])
     def test_centroids_shape(self, bits, expected_n):
         c = get_centroids(128, bits)
         assert c.shape == (expected_n,)
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_centroids_sorted(self, bits):
         _assert_strictly_sorted(get_centroids(128, bits), "centroids")
 
@@ -301,14 +349,14 @@ class TestCentroids:
         c128 = get_centroids(128, 3)
         assert not torch.equal(c64, c128)
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_centroids_symmetric_around_zero(self, bits):
         """N(0, 1/d) is symmetric, so centroids should be ~symmetric."""
         c = get_centroids(128, bits)
         assert abs(c.mean().item()) < 0.01, "Centroids not centered near 0"
         assert abs(c[0].item() + c[-1].item()) < 0.01
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_centroids_within_4sigma(self, bits):
         """All centroids should be within ~4 sigma of N(0, 1/d)."""
         sigma = math.sqrt(1.0 / 128)
@@ -320,23 +368,23 @@ class TestCentroids:
 
 
 class TestLloydMax:
-    @pytest.mark.parametrize("bits,expected_n", [(2, 4), (3, 8), (4, 16)])
+    @pytest.mark.parametrize("bits,expected_n", [(1, 2), (2, 4), (3, 8), (4, 16)])
     def test_solve_shapes(self, bits, expected_n):
         centroids, boundaries = solve_lloyd_max(128, bits)
         assert centroids.shape == (expected_n,)
         assert boundaries.shape == (expected_n - 1,)
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_centroids_sorted(self, bits):
         centroids, _ = solve_lloyd_max(128, bits)
         _assert_strictly_sorted(centroids, "centroids")
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_boundaries_sorted(self, bits):
         _, boundaries = solve_lloyd_max(128, bits)
         _assert_strictly_sorted(boundaries, "boundaries")
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_boundaries_between_centroids(self, bits):
         """Each boundary must lie between its adjacent centroids."""
         centroids, boundaries = solve_lloyd_max(128, bits)
@@ -346,7 +394,7 @@ class TestLloydMax:
                 f"c[{i}]={centroids[i]:.6f} and c[{i + 1}]={centroids[i + 1]:.6f}"
             )
 
-    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_boundaries_are_midpoints(self, bits):
         """Lloyd-Max boundaries are midpoints of adjacent centroids."""
         centroids, boundaries = solve_lloyd_max(128, bits)
@@ -516,7 +564,18 @@ class TestStoreDecodeRoundTrip:
 
     @pytest.mark.parametrize(
         "preset",
-        ["turboquant_k8v4", "turboquant_4bit_nc"],
+        [
+            "turboquant_k8v4",
+            "turboquant_4bit_nc",
+            "turboquant_k3v4_nc",
+            "turboquant_3bit_nc",
+            "turboquant_k4v2_nc",
+            "turboquant_k3v2_nc",
+            "turboquant_2bit_nc",
+            "turboquant_k4v1_nc",
+            "turboquant_k3v1_nc",
+            "turboquant_k2v1_nc",
+        ],
     )
     def test_single_token_roundtrip(self, preset):
         """Store 1 token, decode with query=key, check attention output.
@@ -618,8 +677,16 @@ class TestStoreDecodeRoundTrip:
                 out_fp32[0, h].unsqueeze(0),
                 val_fp32[0, h].unsqueeze(0),
             ).item()
-            # FP8 keys should be very accurate; MSE keys have more error
-            threshold = 0.95 if cfg.key_fp8 else 0.85
+            # FP8 keys should be very accurate; MSE keys have more error;
+            # 1-bit values (2 levels) and 2-bit keys are extremely aggressive
+            if cfg.key_fp8:
+                threshold = 0.95
+            elif cfg.value_quant_bits <= 1:
+                threshold = 0.40
+            elif cfg.value_quant_bits <= 2:
+                threshold = 0.75
+            else:
+                threshold = 0.85
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )

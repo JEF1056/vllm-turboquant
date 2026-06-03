@@ -2362,6 +2362,23 @@ class GPUModelRunner(
                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
+            elif (
+                not use_spec_decode
+                and self.speculative_config is not None
+                and isinstance(
+                    builder,
+                    (Mamba2AttentionMetadataBuilder,
+                     GDNAttentionMetadataBuilder),
+                )
+            ):
+                # PR #40738: On non-spec steps after spec decode, pass
+                # num_accepted_tokens so GDN can recover conv/SSM state
+                # from the correct block.
+                extra_attn_metadata_args = dict(
+                    num_accepted_tokens=self.num_accepted_tokens.gpu[
+                        :num_reqs_padded
+                    ],
+                )
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(

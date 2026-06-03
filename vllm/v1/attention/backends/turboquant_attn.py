@@ -102,6 +102,12 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "turboquant_k4v2_nc",
+        "turboquant_k3v2_nc",
+        "turboquant_2bit_nc",
+        "turboquant_k4v1_nc",
+        "turboquant_k3v1_nc",
+        "turboquant_k2v1_nc",
     ]
 
     @staticmethod
@@ -196,6 +202,10 @@ class TurboQuantMetadata(AttentionMetadata):
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
     """Builds TurboQuantMetadata from scheduler output."""
 
+    # P65 resolved: the multi-query TQ kernel (_multiquery_continuation)
+    # handles spec-decode K+1 verify batches natively with per-position
+    # causal masking and no per-request Python loop, making the
+    # continuation path fully CUDA graph-capturable under UNIFORM_BATCH.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -294,6 +304,66 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+
+        # Pre-allocate decode workspace so the buffer is sized before
+        # lock_workspace(). Without this, speculative decoding crashes:
+        # the drafter's dummy_run() passes attn_metadata=None which
+        # causes forward() to return early, skipping _decode_attention
+        # and its workspace allocation. At runtime, propose() provides
+        # real metadata, _decode_attention runs, and hits the lock.
+        self._reserve_decode_workspace(vllm_config)
+
+    def _reserve_decode_workspace(self, vllm_config) -> None:
+        """Touch WorkspaceManager with max shapes to pre-grow buffer.
+
+        Pre-allocates for both decode attention and continuation prefill
+        so the workspace is large enough before lock_workspace().
+        """
+        if not is_workspace_manager_initialized():
+            return
+        max_batch = vllm_config.scheduler_config.max_num_seqs
+        if max_batch <= 0:
+            return
+        D = self.head_size
+        S = self.max_num_kv_splits
+        Hq = self.num_heads
+        Hk = self.num_kv_heads
+
+        # Decode attention buffers — scale by decode_query_len for
+        # multi-query spec-decode verification batches (B*Q tokens).
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        num_spec = (
+            spec_cfg.num_speculative_tokens
+            if spec_cfg is not None
+            and getattr(spec_cfg, "num_speculative_tokens", None) is not None
+            else 0
+        )
+        decode_query_len = 1 + num_spec
+        max_batch_eff = max_batch * decode_query_len
+        decode_shapes: list[tuple[tuple[int, ...], torch.dtype]] = [
+            ((max_batch_eff, Hq, S, D + 1), torch.float32),  # mid_o_buf
+            ((max_batch_eff, Hq, D), torch.bfloat16),  # output_buf
+            ((max_batch_eff, Hq), torch.float32),  # lse_buf
+        ]
+
+        # Continuation prefill dequant buffers — needed when chunked
+        # prefill splits a long prompt and the second chunk must dequant
+        # cached K/V from TQ format back to fp16.
+        block_size = vllm_config.cache_config.block_size
+        max_model_len = vllm_config.model_config.max_model_len
+        alloc_len = math.ceil(max_model_len / block_size) * block_size
+        cont_shape = (1, Hk, alloc_len, D)
+        cont_shapes: list[tuple[tuple[int, ...], torch.dtype]] = [
+            (cont_shape, torch.float16),  # k_buf
+            (cont_shape, torch.float16),  # v_buf
+        ]
+
+        # Reserve whichever set is larger (continuation prefill dominates
+        # at long context). get_simultaneous grows the buffer to fit all
+        # tensors; the larger call wins and subsequent ones are no-ops.
+        ws = current_workspace_manager()
+        ws.get_simultaneous(*decode_shapes)
+        ws.get_simultaneous(*cont_shapes)
 
     def _flash_attn_varlen(
         self,
@@ -587,14 +657,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=attn_metadata.max_query_len,
             )
 
+        # Multi-query fast path: uniform query length, all continuations,
+        # small Q (spec-decode K+1 verification batches).
+        # Avoids the per-request Python loop — fully CUDA graph-capturable.
+        query_start_loc = attn_metadata.query_start_loc
+        num_reqs = query_start_loc.shape[0] - 1
+        Q = attn_metadata.max_query_len
+        if (
+            Q > 1
+            and Q <= _CONTINUATION_DECODE_THRESHOLD
+            and num_reqs * Q == N
+            and attn_metadata.max_query_len < attn_metadata.max_seq_len
+        ):
+            return self._multiquery_continuation(
+                query, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+            )
+
         # Continuation or no flash_attn: per-request attention.
         # For continuation chunks (seq_len > q_len), we must attend to
         # previously cached K/V from the TQ cache, not just the current
         # chunk's raw K/V.
         Hk = key.shape[1]
         use_gqa = Hk < Hq
-        query_start_loc = attn_metadata.query_start_loc
-        num_reqs = query_start_loc.shape[0] - 1
 
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
 
@@ -799,8 +883,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 0, 1
             )  # (cached_len, Hk, D)
 
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+        # Inverse-rotate cached values back to original space (stored as v @ H)
+        Pi_half_v = layer._tq_Pi_half
+        v_flat = v_cached[0, :, :cached_len, :].reshape(-1, D)
+        v_flat = v_flat @ Pi_half_v
+        v_cached_trim = v_flat.reshape(Hk, cached_len, D).transpose(0, 1)
 
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
@@ -904,3 +991,60 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
+
+    # ------------------------------------------------------------------ #
+    #  Multi-query continuation: vectorized spec-decode verify attention  #
+    # ------------------------------------------------------------------ #
+    def _multiquery_continuation(
+        self,
+        query: torch.Tensor,  # (B*Q, Hq, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Vectorized multi-query attention for uniform-query continuation
+        batches (e.g. spec-decode K+1 verification).
+
+        The kernel derives req_idx and causal mask offset internally from
+        QUERY_LEN, eliminating the per-request Python loop. Fully CUDA
+        graph-capturable with UNIFORM_BATCH.
+        """
+        BQ = query.shape[0]
+        Q = attn_metadata.max_query_len
+        D = self.head_size
+        S = self.max_num_kv_splits
+        Hq = self.num_heads
+        mid_o_buf = output_buf = lse_buf = None
+        if is_workspace_manager_initialized():
+            mid_o_buf, output_buf, lse_buf = (
+                current_workspace_manager().get_simultaneous(
+                    ((BQ, Hq, S, D + 1), torch.float32),
+                    ((BQ, Hq, D), query.dtype),
+                    ((BQ, Hq), torch.float32),
+                )
+            )
+
+        return triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            key_fp8=self.tq_config.key_fp8,
+            norm_correction=self.tq_config.norm_correction,
+            PiT=PiT,
+            mid_o_buf=mid_o_buf,
+            output_buf=output_buf,
+            lse_buf=lse_buf,
+            buf_holder=layer,
+            max_num_kv_splits=self.max_num_kv_splits,
+            query_len=Q,
+        )

@@ -41,7 +41,87 @@ def _store_quantized_value(
     """Uniform quantization of values to VQB bits, pack, and store with scale/zero."""
     val_cache_offset = KPS
 
-    if VQB == 3:
+    if VQB == 1:
+        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
+        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
+        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        v_scale = val_max - val_min
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 1
+        )
+        # Pack 8 values per byte: [v0(1bit) | v1(1bit) | ... | v7(1bit)]
+        q_oct = tl.reshape(q_all, [BLOCK_D // 8, 8])
+        shifts_1 = tl.arange(0, 8)
+        packed_val = tl.sum((q_oct & 0x1) << shifts_1[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 8)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed_val,
+            mask=val_mask,
+        )
+
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 1,
+            ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 3,
+            ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+
+    elif VQB == 2:
+        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
+        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
+        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        v_scale = (val_max - val_min) / 3.0
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 3
+        )
+        # Pack 4 values per byte: [v0(2bit) | v1(2bit) | v2(2bit) | v3(2bit)]
+        q_quad = tl.reshape(q_all, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed_val = tl.sum((q_quad & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 4)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed_val,
+            mask=val_mask,
+        )
+
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 1,
+            ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 3,
+            ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+
+    elif VQB == 3:
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
         )
@@ -314,6 +394,14 @@ def _tq_fused_store_mse(
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
 
+    elif MSE_BITS == 2:
+        idx_quad = tl.reshape(idx, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed = tl.sum((idx_quad & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        mse_offs = tl.arange(0, BLOCK_D // 4)
+        mse_mask = mse_offs < MSE_BYTES
+        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
+
     # ── 3. STORE vec_norm (fp16, 2 bytes) ─────────────────────────────
     norm_offset = MSE_BYTES
 
@@ -381,7 +469,7 @@ def triton_turboquant_store(
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
-        v_flat = value.reshape(NH, D).contiguous()
+        v_flat = (value.float().reshape(NH, D) @ PiT).to(value.dtype).contiguous()
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
@@ -416,7 +504,7 @@ def triton_turboquant_store(
     x_hat = k_flat / (norms + 1e-8)
     y = x_hat @ PiT
 
-    v_flat = value.float().reshape(NH, D)
+    v_flat = value.float().reshape(NH, D) @ PiT  # Hadamard value rotation
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)

@@ -5,7 +5,8 @@
 Decode path: Triton stage1 (split-KV tiled attention scoring + value
 accumulation) + stage2 (log-sum-exp reduction across splits).
 
-Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
+Supports FP8 (E4M3) keys, 1/2/3/4-bit uniform quantized values,
+and Hadamard value rotation for improved low-bit quality.
 """
 
 import math
@@ -83,20 +84,37 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    QUERY_LEN: tl.constexpr = 1,  # uniform query len per request
 ):
-    bid = tl.program_id(0)  # batch index
+    bid_q = tl.program_id(0)  # query index (B*QUERY_LEN for multi-query)
     hid = tl.program_id(1)  # q_head index
     sid = tl.program_id(2)  # kv_split index
 
+    # Derive request index and query position within the request.
+    # When QUERY_LEN=1 (standard decode), req_idx=bid_q and q_pos=0.
+    req_idx = bid_q // QUERY_LEN
+    q_pos = bid_q % QUERY_LEN
+
     kv_head = hid // KV_GROUP_SIZE
 
-    # Sequence length for this batch
-    seq_len = tl.load(Seq_lens_ptr + bid)
+    # Full sequence length for this request (includes cached + new tokens).
+    full_seq_len = tl.load(Seq_lens_ptr + req_idx)
+
+    # Effective seq_len for causal masking: query position q_pos can only
+    # attend to KV positions [0, cached_len + q_pos].
+    # cached_len = full_seq_len - QUERY_LEN, so:
+    #   eff_seq_len = (full_seq_len - QUERY_LEN) + q_pos + 1
+    # When QUERY_LEN=1: eff_seq_len = full_seq_len - 1 + 0 + 1 = full_seq_len.
+    eff_seq_len = full_seq_len - QUERY_LEN + q_pos + 1
+
+    # Guard for padding slots (unused requests have seq_len=0).
+    if eff_seq_len <= 0:
+        return
 
     # KV split range
-    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+    split_len = tl.cdiv(eff_seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
-    split_end = tl.minimum(split_start + split_len, seq_len)
+    split_end = tl.minimum(split_start + split_len, eff_seq_len)
 
     if split_start >= split_end:
         return
@@ -107,7 +125,8 @@ def _tq_decode_stage1(
     kv_range = tl.arange(0, BLOCK_KV)
 
     # Load query vector: q_rot — [BLOCK_D] float32
-    q_base = bid * stride_qb + hid * stride_qh
+    # Index by bid_q (per query-position), not req_idx.
+    q_base = bid_q * stride_qb + hid * stride_qh
     q_rot = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
 
     # Precompute byte/bit index vectors for MSE gather loads
@@ -118,7 +137,14 @@ def _tq_decode_stage1(
         mse_mask = (1 << MSE_BITS) - 1
 
     # Precompute value bit/byte index vectors (loop-invariant)
-    if VQB == 3:
+    if VQB == 1:
+        val_byte_idx = d_offs // 8
+        val_bit_shift = d_offs % 8
+    elif VQB == 2:
+        val_bit_off = d_offs * 2
+        val_byte_idx = val_bit_off // 8
+        val_bit_shift = val_bit_off % 8
+    elif VQB == 3:
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
@@ -128,7 +154,8 @@ def _tq_decode_stage1(
     l_prev = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    bt_base = bid * stride_bt_b
+    # Block table indexed by req_idx (per-request), not bid_q.
+    bt_base = req_idx * stride_bt_b
 
     # ================================================================
     # TILED LOOP: process BLOCK_KV tokens per iteration
@@ -235,7 +262,61 @@ def _tq_decode_stage1(
         # ============================================================
         val_bases = slot_bases + KPS
 
-        if VQB == 3:
+        if VQB == 1:
+            val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs0,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> val_bit_shift[None, :]) & 0x1).to(tl.float32)
+
+            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_scales = (
+                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+        elif VQB == 2:
+            val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs0,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> val_bit_shift[None, :]) & 0x3).to(tl.float32)
+
+            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_scales = (
+                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+        elif VQB == 3:
             val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
             val_raw0 = tl.load(
                 KV_cache_ptr + val_addrs0,
@@ -305,8 +386,8 @@ def _tq_decode_stage1(
         l_prev = l_prev * re_scale + tl.sum(p, 0)
         m_prev = n_e_max
 
-    # Store partial result
-    out_base = bid * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
+    # Store partial result (indexed by bid_q, not req_idx).
+    out_base = bid_q * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
     safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
     tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
     lse = m_prev + tl.log(safe_l)
@@ -410,7 +491,39 @@ def _tq_full_dequant_kv(
 
     # === V dequant ===
     val_base = slot_base + KPS
-    if VQB == 4:
+    if VQB == 1:
+        vb_idx = d_offs // 8
+        vb_shift = d_offs % 8
+        val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
+            tl.int32
+        )
+        v_idx = ((val_raw >> vb_shift) & 0x1).to(tl.float32)
+
+        sc_base = val_base + VAL_DATA_BYTES
+        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
+        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
+        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_vals = v_idx * v_scale + v_zero
+    elif VQB == 2:
+        vb_idx = d_offs // 4
+        vb_shift = (d_offs % 4) * 2
+        val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
+            tl.int32
+        )
+        v_idx = ((val_raw >> vb_shift) & 0x3).to(tl.float32)
+
+        sc_base = val_base + VAL_DATA_BYTES
+        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
+        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
+        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_vals = v_idx * v_scale + v_zero
+    elif VQB == 4:
         vb_idx = d_offs // 2
         vb_shift = (d_offs % 2) * 4
         val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
@@ -484,10 +597,10 @@ def _get_layout(D, mse_bits, value_quant_bits, key_packed_size):
 
 
 def triton_turboquant_decode_attention(
-    query: torch.Tensor,  # [B, Hq, D] — original query
+    query: torch.Tensor,  # [BQ, Hq, D] — original query (BQ = B*query_len)
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, padded_slot] uint8
-    block_table: torch.Tensor,  # [B, max_num_blocks] int32
-    seq_lens: torch.Tensor,  # [B] int32
+    block_table: torch.Tensor,  # [B, max_num_blocks] int32 (per-request)
+    seq_lens: torch.Tensor,  # [B] int32 (per-request)
     Pi: torch.Tensor,  # [D, D] float32
     centroids: torch.Tensor,  # [n_centroids] float32
     scale: float,
@@ -503,12 +616,24 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    query_len: int = 1,  # uniform query length per request (>1 for multi-query)
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
-    Returns: output tensor [B, Hq, D] in query's dtype.
+    When query_len=1 (default), this is standard single-token decode.
+    When query_len>1, this handles multi-query continuation batches
+    (e.g. spec-decode K+1 verification) with per-position causal masking.
+    The kernel derives req_idx and causal offset from the query_len constexpr.
+
+    Args:
+        query: [BQ, Hq, D] where BQ = num_requests * query_len.
+        block_table: [B, max_num_blocks] per-request (B = num_requests).
+        seq_lens: [B] per-request full sequence lengths.
+        query_len: Uniform number of query tokens per request.
+
+    Returns: output tensor [BQ, Hq, D] in query's dtype.
     """
-    B, Hq, D = query.shape
+    BQ, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
@@ -531,13 +656,13 @@ def triton_turboquant_decode_attention(
 
     if (
         mid_o_buf is not None
-        and mid_o_buf.shape[0] >= B
+        and mid_o_buf.shape[0] >= BQ
         and mid_o_buf.shape[2] >= NUM_KV_SPLITS
     ):
-        mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
+        mid_o = mid_o_buf[:BQ, :Hq, :NUM_KV_SPLITS, :]
     else:
         mid_o = torch.empty(
-            B,
+            BQ,
             Hq,
             NUM_KV_SPLITS,
             D + 1,
@@ -550,7 +675,7 @@ def triton_turboquant_decode_attention(
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = 4
-    grid = (B, Hq, NUM_KV_SPLITS)
+    grid = (BQ, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
         kv_cache,
@@ -583,36 +708,52 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        QUERY_LEN=query_len,
         num_warps=1,
         num_stages=1,
     )
 
-    # Stage 2: Reduce across KV splits
-    # Output in query dtype — eliminates float16_copy kernel after stage2
+    # Stage 2: Reduce across KV splits.
+    # Stage2 needs per-query-position effective seq_lens to decide which
+    # splits have data. For query_len=1, seq_lens is used directly.
+    # For query_len>1, compute eff_seq_lens = seq_lens[req] - Q + q_pos + 1.
+    if query_len > 1:
+        B = seq_lens.shape[0]
+        # offsets = [1, 2, ..., query_len] broadcast with cached_lens
+        offsets = torch.arange(1, query_len + 1, device=device, dtype=seq_lens.dtype)
+        # cached_lens = seq_lens - query_len; eff = cached_lens + offsets
+        eff_seq_lens = (
+            (seq_lens[:B].unsqueeze(1) - query_len + offsets).clamp_(min=0).reshape(-1)
+        )
+        stage2_seq_lens = eff_seq_lens[:BQ]
+    else:
+        stage2_seq_lens = seq_lens
+
+    # Stage 2: Output in query dtype — eliminates float16_copy kernel
     out_dtype = query.dtype
     if (
         output_buf is not None
-        and output_buf.shape[0] >= B
+        and output_buf.shape[0] >= BQ
         and output_buf.dtype == out_dtype
     ):
-        output = output_buf[:B, :Hq, :D]
+        output = output_buf[:BQ, :Hq, :D]
     else:
-        output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
+        output = torch.empty(BQ, Hq, D, dtype=out_dtype, device=device)
         if buf_holder is not None:
             buf_holder._tq_output_buf = output
-    if lse_buf is not None and lse_buf.shape[0] >= B:
-        lse = lse_buf[:B, :Hq]
+    if lse_buf is not None and lse_buf.shape[0] >= BQ:
+        lse = lse_buf[:BQ, :Hq]
     else:
-        lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+        lse = torch.empty(BQ, Hq, dtype=torch.float32, device=device)
         if buf_holder is not None:
             buf_holder._tq_lse_buf = lse
 
-    grid2 = (B, Hq)
+    grid2 = (BQ, Hq)
     _fwd_kernel_stage2[grid2](
         mid_o,
         output,
         lse,
-        seq_lens,
+        stage2_seq_lens,
         mid_o.stride(0),
         mid_o.stride(1),
         mid_o.stride(2),
@@ -627,4 +768,8 @@ def triton_turboquant_decode_attention(
         num_stages=2,
     )
 
-    return output  # already in query dtype
+    # Inverse Hadamard rotation: values were stored as v @ H, undo here.
+    # H is orthogonal symmetric (H^{-1} = H = Pi), so output @ Pi recovers
+    # the original-space attention output in a single cuBLAS GEMM.
+    rotated = output.view(-1, D).float() @ Pi
+    return rotated.to(out_dtype).view(BQ, Hq, D)
