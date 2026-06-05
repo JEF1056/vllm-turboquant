@@ -545,53 +545,61 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
             # --- Prefill portion (remaining requests) ---
-            # CRITICAL: use prefill-specific max_seq_len so flash_attn's
-            # fast path (max_query_len == max_seq_len) triggers for
-            # first-chunk prefills. Using full-batch max_seq_len breaks
-            # this because decode requests inflate max_seq_len.
-            prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use the CPU-resident `seq_lens` upper-bound from the metadata
-            # (populated in the builder) to compute the prefill sub-batch
-            # max without a GPU→CPU sync.
-            if attn_metadata.seq_lens_cpu is not None:
-                prefill_max_seq = int(attn_metadata.seq_lens_cpu[num_decodes:].max())
-            else:
-                prefill_max_seq = attn_metadata.max_seq_len
-            prefill_qsl = (
-                attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
-            )
-            prefill_qsl_cpu = None
-            if attn_metadata.query_start_loc_cpu is not None:
-                prefill_qsl_cpu = (
-                    attn_metadata.query_start_loc_cpu[num_decodes:] - num_decode_tokens
+            # Skip when all tokens are decode (e.g. uniform_decode warmup).
+            if num_decode_tokens < N:
+                # CRITICAL: use prefill-specific max_seq_len so flash_attn's
+                # fast path (max_query_len == max_seq_len) triggers for
+                # first-chunk prefills. Using full-batch max_seq_len breaks
+                # this because decode requests inflate max_seq_len.
+                prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
+                # Use the CPU-resident `seq_lens` upper-bound from the
+                # metadata (populated in the builder) to compute the prefill
+                # sub-batch max without a GPU→CPU sync.
+                if attn_metadata.seq_lens_cpu is not None:
+                    prefill_max_seq = int(
+                        attn_metadata.seq_lens_cpu[num_decodes:].max()
+                    )
+                else:
+                    prefill_max_seq = attn_metadata.max_seq_len
+                prefill_qsl = (
+                    attn_metadata.query_start_loc[num_decodes:]
+                    - num_decode_tokens
                 )
-            prefill_meta = TurboQuantMetadata(
-                seq_lens=prefill_seq_lens,
-                slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
-                block_table=attn_metadata.block_table[num_decodes:],
-                query_start_loc=prefill_qsl,
-                num_actual_tokens=N - num_decode_tokens,
-                max_query_len=attn_metadata.max_query_len,
-                max_seq_len=prefill_max_seq,
-                is_prefill=True,
-                query_start_loc_cpu=prefill_qsl_cpu,
-                seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
-                if attn_metadata.seq_lens_cpu is not None
-                else None,
-            )
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out[num_decode_tokens:] = self._prefill_attention(
-                q[num_decode_tokens:],
-                k[num_decode_tokens:],
-                v[num_decode_tokens:],
-                kv_cache,
-                prefill_meta,
-                Pi,
-                centroids,
-                PiT,
-                layer=layer,
-            )
+                prefill_qsl_cpu = None
+                if attn_metadata.query_start_loc_cpu is not None:
+                    prefill_qsl_cpu = (
+                        attn_metadata.query_start_loc_cpu[num_decodes:]
+                        - num_decode_tokens
+                    )
+                prefill_meta = TurboQuantMetadata(
+                    seq_lens=prefill_seq_lens,
+                    slot_mapping=attn_metadata.slot_mapping[
+                        num_decode_tokens:N
+                    ],
+                    block_table=attn_metadata.block_table[num_decodes:],
+                    query_start_loc=prefill_qsl,
+                    num_actual_tokens=N - num_decode_tokens,
+                    max_query_len=attn_metadata.max_query_len,
+                    max_seq_len=prefill_max_seq,
+                    is_prefill=True,
+                    query_start_loc_cpu=prefill_qsl_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
+                    if attn_metadata.seq_lens_cpu is not None
+                    else None,
+                )
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out[num_decode_tokens:] = self._prefill_attention(
+                    q[num_decode_tokens:],
+                    k[num_decode_tokens:],
+                    v[num_decode_tokens:],
+                    kv_cache,
+                    prefill_meta,
+                    Pi,
+                    centroids,
+                    PiT,
+                    layer=layer,
+                )
 
         # Write into output buffer: attn_out is (N, Hq, D)
         # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
