@@ -399,7 +399,7 @@ def _tq_decode_stage1(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
 def _tq_full_dequant_kv(
     KV_cache_ptr,
     Block_table_ptr,

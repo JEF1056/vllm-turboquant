@@ -711,6 +711,14 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        # Pre-compile Triton JIT kernels not covered by _dummy_run
+        # (KV cache ops, TurboQuant decode, spec decode utils, Mamba/FLA).
+        from vllm.model_executor.warmup.triton_kernel_warmup import (
+            warmup_triton_jit_kernels,
+        )
+
+        warmup_triton_jit_kernels(self.model_runner)
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.triton_utils.jit_monitor import (

@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[6, 14])
 def postprocess_mamba_fused_kernel(
     # Decision inputs (per-request)
     num_accepted_tokens_ptr,

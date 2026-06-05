@@ -322,7 +322,7 @@ class MultiGroupBlockTable:
         return self.block_tables[idx]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[0, 1, 5, 6])
 def _compute_slot_mapping_kernel(
     num_tokens,
     max_num_tokens,
