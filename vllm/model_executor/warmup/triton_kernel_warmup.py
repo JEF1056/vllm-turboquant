@@ -27,11 +27,27 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _find_attention_group_index(model_runner: GPUModelRunner) -> int:
+    """Return the index of the first attention (non-Mamba) KV cache group.
+
+    For hybrid models (e.g., Qwen3.5 with both attention and Mamba layers),
+    the first KV cache group may be a Mamba group. Several warmup functions
+    need the *attention* group's block table / block_size to match runtime
+    constexprs. Using index 0 blindly causes constexpr mismatches on hybrid
+    models, leading to JIT recompilation during inference.
+    """
+    for i, group in enumerate(model_runner.kv_cache_config.kv_cache_groups):
+        if isinstance(group.kv_cache_spec, AttentionSpec):
+            return i
+    return 0  # fallback for non-hybrid models
 
 
 def warmup_triton_jit_kernels(model_runner: GPUModelRunner) -> None:
@@ -53,6 +69,7 @@ def warmup_triton_jit_kernels(model_runner: GPUModelRunner) -> None:
 
     if model_runner.model_config.is_hybrid:
         warmup_mamba_hybrid_kernels(model_runner)
+        warmup_batch_memcpy_kernel(device)
 
         # The postprocess kernel is only used when spec decode + hybrid.
         if model_runner.speculative_config is not None:
@@ -115,8 +132,11 @@ def warmup_kv_cache_kernels(model_runner: GPUModelRunner, device: torch.device) 
     max_num_blocks_per_req = 4
     block_size = 16
     # Read the real block size and cp_kv_cache_interleave_size from the
-    # actual block table to match runtime constexprs exactly.
-    bt = model_runner.input_batch.block_table.block_tables[0]
+    # attention group's block table to match runtime constexprs exactly.
+    # For hybrid models (e.g., Qwen3.5), group 0 may be a Mamba group
+    # whose block_size differs from the attention block_size.
+    attn_group_idx = _find_attention_group_index(model_runner)
+    bt = model_runner.input_batch.block_table.block_tables[attn_group_idx]
     block_size = bt.block_size
     cp_kv_cache_interleave_size = bt.cp_kv_cache_interleave_size
     max_num_blocks_per_req = bt.max_num_blocks_per_req
@@ -185,10 +205,11 @@ def warmup_turboquant_decode_kernels(
 
     # Build minimal dummy tensors.
     BQ = 2  # 2 query positions
-    block_size = 16
+    # Use the attention group's block_size — for hybrid models, group 0
+    # may be a Mamba group with a different block_size.
+    attn_group_idx = _find_attention_group_index(model_runner)
     kv_groups = model_runner.kv_cache_config.kv_cache_groups
-    if kv_groups:
-        block_size = kv_groups[0].kv_cache_spec.block_size
+    block_size = kv_groups[attn_group_idx].kv_cache_spec.block_size if kv_groups else 16
     num_blocks = 2
     slot_size_aligned = tq_config.slot_size_aligned
     padded_slot = slot_size_aligned // 2  # stored as int16 -> byte pairs
@@ -323,10 +344,12 @@ def warmup_spec_decode_kernels(
     num_reqs = 2
     num_spec_tokens = model_runner.speculative_config.num_speculative_tokens
     vocab_size = model_runner.model_config.get_vocab_size()
-    # Read block_size and n_blocks_per_req from the actual block table
-    # to match runtime constexprs exactly. The warmup previously
-    # hardcoded n_blocks_per_req=4 which mismatched the real value.
-    bt = model_runner.input_batch.block_table.block_tables[0]
+    # Read block_size and n_blocks_per_req from the attention group's
+    # block table to match runtime constexprs exactly. For hybrid models
+    # (e.g., Qwen3.5), group 0 may be a Mamba group whose block_size
+    # differs from the attention block_size used by spec decode.
+    attn_group_idx = _find_attention_group_index(model_runner)
+    bt = model_runner.input_batch.block_table.block_tables[attn_group_idx]
     block_size = bt.block_size
     max_model_len = model_runner.model_config.max_model_len
     n_blocks_per_req = bt.max_num_blocks_per_req
@@ -475,6 +498,38 @@ def warmup_mamba_hybrid_kernels(model_runner: GPUModelRunner) -> None:
         uniform_decode=True,
     )
     logger.debug("Warmed up Mamba/FLA decode path via uniform-decode dummy run.")
+
+
+# ---------------------------------------------------------------------------
+# Group 4b: batch_memcpy_kernel (Mamba state copy during prefix caching)
+# ---------------------------------------------------------------------------
+
+
+def warmup_batch_memcpy_kernel(device: torch.device) -> None:
+    """Warm up batch_memcpy_kernel used for Mamba state block copies.
+
+    This kernel is triggered by do_mamba_copy_block() when prefix caching
+    requires copying Mamba states between blocks. The _dummy_run() warmup
+    does not exercise this path, so it must be compiled explicitly.
+    """
+    if not HAS_TRITON:
+        return
+    from vllm.v1.worker.mamba_utils import batch_memcpy_kernel
+
+    # Minimal launch: 1 copy operation with BLOCK_SIZE=1024 (matches runtime).
+    n = 1
+    scratch = torch.zeros(2048, dtype=torch.uint8, device=device)
+    src_ptrs = torch.tensor(
+        [scratch.data_ptr()], dtype=torch.int64, device=device
+    )
+    dst_ptrs = torch.tensor(
+        [scratch.data_ptr() + 1024], dtype=torch.int64, device=device
+    )
+    sizes = torch.tensor([512], dtype=torch.int32, device=device)
+
+    batch_memcpy_kernel[(n,)](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=1024)
+    del scratch
+    logger.debug("Warmed up batch_memcpy_kernel.")
 
 
 # ---------------------------------------------------------------------------
